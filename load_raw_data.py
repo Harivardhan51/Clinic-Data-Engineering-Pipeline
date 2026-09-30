@@ -1,22 +1,4 @@
-"""
-load_raw_data.py
-
-Loads the four CSV files from data/raw/
-into the PostgreSQL raw schema.
-
-CSV files:
-    patients.csv
-    providers.csv
-    appointments.csv
-    payments.csv
-
-PostgreSQL tables:
-    raw.patients_file
-    raw.providers_file
-    raw.appointments_file
-    raw.payments_file
-"""
-
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -24,15 +6,9 @@ import psycopg2
 
 
 # ============================================================
-# CONFIGURATION
+# DATABASE CONFIGURATION
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-
-RAW_DIR = BASE_DIR / "data" / "raw"
-
-
-# PostgreSQL connection details
 DB_CONFIG = {
     "host": "localhost",
     "port": 5432,
@@ -43,10 +19,19 @@ DB_CONFIG = {
 
 
 # ============================================================
-# FILE -> TABLE MAPPING
+# PROJECT PATHS
 # ============================================================
 
-FILE_TABLE_MAPPING = {
+BASE_DIR = Path(__file__).resolve().parent
+
+RAW_DATA_DIR = BASE_DIR / "data" / "raw"
+
+
+# ============================================================
+# TABLE MAPPING
+# ============================================================
+
+TABLE_MAPPING = {
     "patients.csv": "raw.patients_file",
     "providers.csv": "raw.providers_file",
     "appointments.csv": "raw.appointments_file",
@@ -55,124 +40,200 @@ FILE_TABLE_MAPPING = {
 
 
 # ============================================================
-# LOAD CSV INTO POSTGRESQL
+# GET BATCH ID
 # ============================================================
 
-def load_csv_to_postgres(
-    connection,
-    csv_file,
-    table_name
-):
+if len(sys.argv) < 2:
+    raise ValueError(
+        "batch_id is required.\n"
+        "Example:\n"
+        "python load_raw_data.py BATCH_20260908_231500"
+    )
+
+batch_id = sys.argv[1]
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_connection():
     """
-    Read a CSV file and insert its records
-    into the specified PostgreSQL table.
+    Create and return a PostgreSQL database connection.
     """
 
-    csv_path = RAW_DIR / csv_file
+    return psycopg2.connect(
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        database=DB_CONFIG["database"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+    )
 
-    print()
-    print("-" * 60)
-    print(f"Loading: {csv_file}")
-    print(f"Target : {table_name}")
-    print("-" * 60)
 
-    # Check whether CSV exists
+# ============================================================
+# LOAD ONE CSV INTO ONE RAW TABLE
+# ============================================================
+
+def load_csv_to_table(connection, csv_file, table_name, batch_id):
+    """
+    Read one CSV file and load it into the specified raw table.
+
+    Existing data in the raw table is cleared before loading.
+    Every row receives the current pipeline batch_id.
+    """
+
+    csv_path = RAW_DATA_DIR / csv_file
+
     if not csv_path.exists():
-
-        print(
-            f"ERROR: File not found: {csv_path}"
+        raise FileNotFoundError(
+            f"CSV file not found: {csv_path}"
         )
 
-        return False
+    print(f"Reading: {csv_path}")
 
-    try:
+    df = pd.read_csv(csv_path)
 
-        # Read CSV
-        df = pd.read_csv(
-            csv_path,
-            dtype=str
+    print(f"Rows read: {len(df)}")
+
+    # --------------------------------------------------------
+    # Add pipeline batch ID
+    # --------------------------------------------------------
+
+    df["batch_id"] = batch_id
+
+    # --------------------------------------------------------
+    # Convert NaN to None
+    # PostgreSQL will store these as NULL
+    # --------------------------------------------------------
+
+    df = df.where(pd.notnull(df), None)
+
+    # --------------------------------------------------------
+    # Clear existing raw table
+    # --------------------------------------------------------
+
+    print(f"Clearing table: {table_name}")
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"TRUNCATE TABLE {table_name}"
         )
 
-        # Replace NaN with None
-        df = df.where(
-            pd.notnull(df),
-            None
+    connection.commit()
+
+    # --------------------------------------------------------
+    # Get column names from PostgreSQL table
+    # --------------------------------------------------------
+
+    schema_name, table_only = table_name.split(".")
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (schema_name, table_only),
         )
 
-        print(
-            f"Records found: {len(df)}"
-        )
-
-        # Get column names
-        columns = list(df.columns)
-
-        column_string = ", ".join(
-            f'"{column}"'
-            for column in columns
-        )
-
-        # Create placeholders
-        placeholders = ", ".join(
-            ["%s"] * len(columns)
-        )
-
-        insert_sql = f"""
-            INSERT INTO {table_name}
-            ({column_string})
-            VALUES ({placeholders})
-        """
-
-        cursor = connection.cursor()
-
-        # Convert DataFrame rows to tuples
-        rows = [
-            tuple(row)
-            for row in df.itertuples(
-                index=False,
-                name=None
-            )
+        database_columns = [
+            row[0]
+            for row in cursor.fetchall()
         ]
 
-        # Insert records
+    # --------------------------------------------------------
+    # Check that CSV columns match database columns
+    # --------------------------------------------------------
+
+    missing_columns = [
+        column
+        for column in database_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing columns for {table_name}: "
+            f"{missing_columns}"
+        )
+
+    # --------------------------------------------------------
+    # Use only columns that exist in database
+    # --------------------------------------------------------
+
+    df = df[database_columns]
+
+    # --------------------------------------------------------
+    # Build INSERT statement
+    # --------------------------------------------------------
+
+    column_names = ", ".join(
+        f'"{column}"'
+        for column in database_columns
+    )
+
+    placeholders = ", ".join(
+        ["%s"] * len(database_columns)
+    )
+
+    insert_query = f"""
+        INSERT INTO {table_name}
+        ({column_names})
+        VALUES ({placeholders})
+    """
+
+    # --------------------------------------------------------
+    # Insert records
+    # --------------------------------------------------------
+
+    records = [
+        tuple(row)
+        for row in df.itertuples(
+            index=False,
+            name=None
+        )
+    ]
+
+    print(
+        f"Loading {len(records)} rows into {table_name}..."
+    )
+
+    with connection.cursor() as cursor:
+
         cursor.executemany(
-            insert_sql,
-            rows
+            insert_query,
+            records
         )
 
-        connection.commit()
+    connection.commit()
 
-        cursor.close()
+    print(
+        f"Successfully loaded {len(records)} rows "
+        f"into {table_name}"
+    )
 
-        print(
-            f"SUCCESS: {len(df)} records loaded "
-            f"into {table_name}"
-        )
-
-        return True
-
-    except Exception as error:
-
-        connection.rollback()
-
-        print(
-            f"ERROR loading {csv_file}:"
-        )
-
-        print(error)
-
-        return False
+    return len(records)
 
 
 # ============================================================
-# MAIN
+# MAIN LOAD PROCESS
 # ============================================================
 
 def main():
+    """
+    Load all four CSV files into PostgreSQL raw tables.
+    """
 
-    print()
     print("=" * 60)
-    print("POSTGRESQL RAW DATA LOAD")
+    print("RAW DATA LOAD STARTED")
     print("=" * 60)
+
+    print(f"Batch ID: {batch_id}")
+    print(f"Raw data directory: {RAW_DATA_DIR}")
 
     connection = None
 
@@ -182,78 +243,90 @@ def main():
         # Connect to PostgreSQL
         # ----------------------------------------------------
 
-        print()
-        print("Connecting to PostgreSQL...")
+        print("\nConnecting to PostgreSQL...")
 
-        connection = psycopg2.connect(
-            host=DB_CONFIG["host"],
-            port=DB_CONFIG["port"],
-            database=DB_CONFIG["database"],
-            user=DB_CONFIG["user"],
-            password=DB_CONFIG["password"],
-        )
+        connection = get_connection()
 
-        print(
-            "SUCCESS: Connected to clinic_db"
-        )
+        print("PostgreSQL connection successful.")
+
+        total_rows = 0
 
         # ----------------------------------------------------
-        # Load all four files
+        # Load each CSV
         # ----------------------------------------------------
 
-        successful_loads = 0
+        for csv_file, table_name in TABLE_MAPPING.items():
 
-        for csv_file, table_name in FILE_TABLE_MAPPING.items():
+            print("\n" + "-" * 60)
 
-            success = load_csv_to_postgres(
-                connection,
-                csv_file,
-                table_name
+            rows_loaded = load_csv_to_table(
+                connection=connection,
+                csv_file=csv_file,
+                table_name=table_name,
+                batch_id=batch_id,
             )
 
-            if success:
-                successful_loads += 1
+            total_rows += rows_loaded
 
         # ----------------------------------------------------
-        # Final summary
+        # Verify batch IDs
         # ----------------------------------------------------
 
-        print()
-        print("=" * 60)
-        print("LOAD SUMMARY")
-        print("=" * 60)
-
-        print(
-            f"Successfully loaded: "
-            f"{successful_loads}/"
-            f"{len(FILE_TABLE_MAPPING)} files"
-        )
-
+        print("\n" + "=" * 60)
+        print("BATCH VERIFICATION")
         print("=" * 60)
 
-    except psycopg2.Error as error:
+        with connection.cursor() as cursor:
 
-        print()
-        print(
-            "ERROR: Could not connect to PostgreSQL."
-        )
+            for table_name in TABLE_MAPPING.values():
 
-        print(error)
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {table_name}
+                    WHERE batch_id = %s
+                    """,
+                    (batch_id,),
+                )
+
+                count = cursor.fetchone()[0]
+
+                print(
+                    f"{table_name}: "
+                    f"{count} rows for batch {batch_id}"
+                )
+
+        print("\n" + "=" * 60)
+        print("RAW DATA LOAD COMPLETED")
+        print("=" * 60)
+
+        print(f"Total rows loaded: {total_rows}")
+
+    except Exception as error:
+
+        if connection:
+            connection.rollback()
+
+        print("\n" + "=" * 60)
+        print("RAW DATA LOAD FAILED")
+        print("=" * 60)
+
+        print(f"Error: {error}")
+
+        raise
 
     finally:
 
-        if connection is not None:
-
+        if connection:
             connection.close()
 
-            print()
             print(
-                "PostgreSQL connection closed."
+                "\nPostgreSQL connection closed."
             )
 
 
 # ============================================================
-# PROGRAM ENTRY POINT
+# SCRIPT ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":

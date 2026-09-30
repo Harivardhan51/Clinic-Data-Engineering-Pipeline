@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+
+logs/
+*.log
+
+config/config.yaml
+
+data/raw/*
+data/processed/*
+
+.env
